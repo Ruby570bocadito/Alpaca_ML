@@ -1,0 +1,239 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Punto de entrada principal para el sistema de trading con IA para Alpaca.
+Este módulo orquesta todos los componentes del sistema.
+"""
+
+import argparse
+import logging
+import os
+import sys
+import time
+from typing import Dict, List, Optional
+
+# Importaciones internas
+from src.config import load_config
+from src.data.ingest import DataIngestionManager
+from .features.engineering import FeatureEngineer
+from .models.model import ModelManager
+from .strategy.signals import SignalGenerator
+from .strategy.portfolio import PortfolioManager
+from .execution.alpaca_client import AlpacaClient
+from .execution.order_manager import OrderManager
+from .risk.risk_manager import RiskManager
+from .monitoring.metrics import MetricsManager
+from .utils.logging import setup_logging
+
+
+def parse_args():
+    """Parsea los argumentos de línea de comandos."""
+    parser = argparse.ArgumentParser(description="Sistema de Trading con IA para Alpaca")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["backtest", "paper", "live"],
+        default="paper",
+        help="Modo de ejecución: backtest, paper o live",
+    )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default="ml_strategy",
+        help="Estrategia a utilizar",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        help="Fecha de inicio para backtesting (formato: YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        help="Fecha de fin para backtesting (formato: YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--symbols",
+        type=str,
+        help="Lista de símbolos separados por comas",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="INFO",
+        help="Nivel de logging",
+    )
+    return parser.parse_args()
+
+
+class TradingSystem:
+    """Clase principal que orquesta el sistema de trading."""
+
+    def __init__(self, config: Dict):
+        """Inicializa el sistema de trading.
+
+        Args:
+            config: Configuración del sistema
+        """
+        self.config = config
+        self.mode = config.get("TRADING_MODE", "paper")
+        self.symbols = config.get("SYMBOLS", "").split(",")
+        self.logger = logging.getLogger(__name__)
+
+        # Inicializar componentes
+        self.alpaca_client = AlpacaClient(config)
+        self.data_manager = DataIngestionManager(config, self.alpaca_client)
+        self.feature_engineer = FeatureEngineer(config)
+        self.model_manager = ModelManager(config)
+        self.signal_generator = SignalGenerator(config)
+        self.portfolio_manager = PortfolioManager(config)
+        self.order_manager = OrderManager(config, self.alpaca_client)
+        self.risk_manager = RiskManager(config, self.alpaca_client)
+        self.metrics_collector = MetricsManager(config)
+
+        self.logger.info(f"Sistema de trading inicializado en modo: {self.mode}")
+        self.logger.info(f"Símbolos configurados: {self.symbols}")
+
+    def run_backtest(self, start_date: str, end_date: str):
+        """Ejecuta el sistema en modo backtest.
+
+        Args:
+            start_date: Fecha de inicio del backtest
+            end_date: Fecha de fin del backtest
+        """
+        self.logger.info(f"Iniciando backtest desde {start_date} hasta {end_date}")
+        
+        # Obtener datos históricos
+        historical_data = self.data_manager.get_historical_data(
+            symbols=self.symbols,
+            start_date=start_date,
+            end_date=end_date,
+            timeframe="1D",
+        )
+        
+        # Procesar datos y generar features
+        features_data = self.feature_engineer.process_data(historical_data)
+        
+        # Generar predicciones
+        predictions = self.model_manager.predict(features_data)
+        
+        # Generar señales
+        signals = self.signal_generator.generate_signals(predictions)
+        
+        # Simular ejecución de órdenes
+        portfolio_history = self.portfolio_manager.simulate_portfolio(
+            signals=signals,
+            historical_data=historical_data,
+        )
+        
+        # Calcular métricas
+        metrics = self.metrics_collector.calculate_backtest_metrics(portfolio_history)
+        
+        self.logger.info(f"Backtest completado. Métricas: {metrics}")
+        return metrics
+
+    def run_trading_loop(self):
+        """Ejecuta el bucle principal de trading en modo paper o live."""
+        self.logger.info(f"Iniciando bucle de trading en modo: {self.mode}")
+        
+        try:
+            while True:
+                # Verificar horario de mercado
+                if not self._is_market_open():
+                    self.logger.info("Mercado cerrado. Esperando...")
+                    time.sleep(60)  # Esperar 1 minuto
+                    continue
+                
+                # Obtener datos en tiempo real
+                market_data = self.data_manager.get_realtime_data(self.symbols)
+                
+                # Procesar datos y generar features
+                features_data = self.feature_engineer.process_data(market_data)
+                
+                # Generar predicciones
+                predictions = self.model_manager.predict(features_data)
+                
+                # Generar señales
+                signals = self.signal_generator.generate_signals(predictions)
+                
+                # Verificar restricciones de riesgo
+                approved_signals = self.risk_manager.validate_signals(signals)
+                
+                # Calcular tamaños de posición
+                orders = self.portfolio_manager.generate_orders(approved_signals)
+                
+                # Ejecutar órdenes
+                if orders:
+                    self.order_manager.execute_orders(orders)
+                
+                # Recolectar métricas
+                self.metrics_collector.collect_metrics()
+                
+                # Esperar para el siguiente ciclo
+                time.sleep(self.config.get("TRADING_INTERVAL_SECONDS", 60))
+                
+        except KeyboardInterrupt:
+            self.logger.info("Deteniendo el sistema de trading...")
+            self._cleanup()
+        except Exception as e:
+            self.logger.error(f"Error en el bucle de trading: {e}", exc_info=True)
+            self._cleanup()
+            raise
+
+    def _is_market_open(self) -> bool:
+        """Verifica si el mercado está abierto."""
+        if self.mode == "backtest":
+            return True
+        return self.alpaca_client.is_market_open()
+
+    def _cleanup(self):
+        """Limpia recursos y realiza tareas de cierre."""
+        self.logger.info("Realizando limpieza de recursos...")
+        # Cerrar conexiones, guardar estado, etc.
+        self.metrics_collector.save_metrics()
+
+
+def main():
+    """Función principal."""
+    # Parsear argumentos
+    args = parse_args()
+    
+    try:
+        # Cargar configuración
+        config = load_config()
+        
+        # Ajustar nivel de logging desde CLI y configurar logging correctamente
+        if args.log_level:
+            config["LOG_LEVEL"] = args.log_level
+        setup_logging(config)
+        logger = logging.getLogger(__name__)
+        
+        # Sobrescribir configuración con argumentos de línea de comandos
+        if args.mode:
+            config["TRADING_MODE"] = args.mode
+        if args.strategy:
+            config["STRATEGY"] = args.strategy
+        if args.symbols:
+            config["SYMBOLS"] = args.symbols
+        
+        # Inicializar sistema
+        trading_system = TradingSystem(config)
+        
+        # Ejecutar en modo correspondiente
+        if args.mode == "backtest":
+            if not args.start_date or not args.end_date:
+                logger.error("Se requieren fechas de inicio y fin para el modo backtest")
+                sys.exit(1)
+            trading_system.run_backtest(args.start_date, args.end_date)
+        else:
+            trading_system.run_trading_loop()
+            
+    except Exception as e:
+        logger.error(f"Error al iniciar el sistema: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

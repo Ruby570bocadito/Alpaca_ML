@@ -1,0 +1,264 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Módulo para el entrenamiento de modelos de machine learning.
+"""
+
+import logging
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Union, Any, Tuple
+
+# Importaciones internas
+from data.ingest import DataIngestionManager
+from features.engineering import FeatureEngineer
+from models.model import ModelManager
+
+logger = logging.getLogger(__name__)
+
+
+class ModelTrainer:
+    """Clase para el entrenamiento de modelos de machine learning."""
+
+    def __init__(self, config: Dict[str, Any]):
+        """Inicializa el entrenador de modelos.
+
+        Args:
+            config: Configuración del sistema
+        """
+        self.config = config
+        self.data_manager = DataIngestionManager(config)
+        self.feature_engineer = FeatureEngineer(config)
+        self.model_manager = ModelManager(config)
+        
+        # Configuración de entrenamiento
+        self.training_config = {
+            "lookback_days": int(config.get("TRAINING_LOOKBACK_DAYS", "365")),
+            "test_size": float(config.get("TEST_SIZE", "0.2")),
+            "symbols": config.get("SYMBOLS", "").split(","),
+            "timeframe": config.get("TRAINING_TIMEFRAME", "1D"),
+        }
+        
+        logger.info("Entrenador de modelos inicializado")
+
+    def train_models(self, symbols: Optional[List[str]] = None, force_retrain: bool = False) -> Dict[str, Any]:
+        """Entrena modelos para los símbolos especificados.
+
+        Args:
+            symbols: Lista de símbolos (opcional, usa configuración si es None)
+            force_retrain: Forzar reentrenamiento aunque exista modelo guardado
+
+        Returns:
+            Dict[str, Any]: Resultados del entrenamiento
+        """
+        if symbols is None:
+            symbols = self.training_config["symbols"]
+        
+        logger.info(f"Iniciando entrenamiento para {len(symbols)} símbolos")
+        
+        # Calcular fechas para datos históricos
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=self.training_config["lookback_days"])).strftime("%Y-%m-%d")
+        
+        # Obtener datos históricos
+        historical_data = self.data_manager.get_historical_data(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            timeframe=self.training_config["timeframe"],
+        )
+        
+        if not historical_data:
+            logger.error("No se pudieron obtener datos históricos para entrenamiento")
+            return {"status": "error", "message": "No se pudieron obtener datos históricos"}
+        
+        # Procesar datos y generar features
+        features_data = {}
+        for symbol, df in historical_data.items():
+            try:
+                # Generar features
+                features_df = self.feature_engineer.process_data({symbol: df})[symbol]
+                
+                # Crear variable objetivo
+                features_df = self.feature_engineer.create_target_variable(
+                    features_df, 
+                    horizon=int(self.config.get("PREDICTION_HORIZON", "1")),
+                )
+                
+                # Crear features retardadas
+                features_df = self.feature_engineer.create_lagged_features(
+                    features_df, 
+                    lag_periods=[1, 2, 3, 5, 10],
+                )
+                
+                features_data[symbol] = features_df
+                logger.info(f"Features generadas para {symbol}: {features_df.shape}")
+                
+            except Exception as e:
+                logger.error(f"Error al generar features para {symbol}: {e}", exc_info=True)
+        
+        # Entrenar modelos
+        training_results = self.model_manager.train(features_data, force_retrain)
+        
+        # Evaluar modelos
+        evaluation_results = self._evaluate_models(features_data, training_results)
+        
+        # Combinar resultados
+        results = {
+            "status": "success",
+            "training": training_results,
+            "evaluation": evaluation_results,
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+        logger.info(f"Entrenamiento completado para {len(training_results)} símbolos")
+        return results
+
+    def _evaluate_models(self, features_data: Dict[str, pd.DataFrame], training_results: Dict[str, Any]) -> Dict[str, Any]:
+        """Evalúa los modelos entrenados.
+
+        Args:
+            features_data: Diccionario con DataFrames de features por símbolo
+            training_results: Resultados del entrenamiento
+
+        Returns:
+            Dict[str, Any]: Resultados de la evaluación
+        """
+        evaluation_results = {}
+        
+        for symbol, result in training_results.items():
+            if result["status"] != "trained" and result["status"] != "loaded":
+                continue
+            
+            try:
+                # Obtener datos para evaluación
+                if symbol not in features_data:
+                    logger.warning(f"No hay datos para evaluar modelo de {symbol}")
+                    continue
+                
+                df = features_data[symbol]
+                
+                # Dividir datos en entrenamiento y prueba
+                test_size = int(len(df) * self.training_config["test_size"])
+                train_df = df.iloc[:-test_size]
+                test_df = df.iloc[-test_size:]
+                
+                # Generar predicciones en conjunto de prueba
+                predictions = self.model_manager.predict({symbol: test_df})
+                
+                if symbol not in predictions:
+                    logger.warning(f"No se generaron predicciones para {symbol}")
+                    continue
+                
+                pred_df = predictions[symbol]
+                
+                # Combinar predicciones con datos reales
+                eval_df = test_df.copy()
+                eval_df["prediction"] = pred_df["prediction"]
+                if "probability" in pred_df.columns:
+                    eval_df["probability"] = pred_df["probability"]
+                
+                # Calcular métricas de evaluación
+                metrics = self._calculate_metrics(eval_df)
+                
+                evaluation_results[symbol] = {
+                    "metrics": metrics,
+                    "samples": len(test_df),
+                }
+                
+                logger.info(f"Evaluación para {symbol}: {metrics}")
+                
+            except Exception as e:
+                logger.error(f"Error al evaluar modelo para {symbol}: {e}", exc_info=True)
+                evaluation_results[symbol] = {"status": "error", "message": str(e)}
+        
+        return evaluation_results
+
+    def _calculate_metrics(self, df: pd.DataFrame) -> Dict[str, float]:
+        """Calcula métricas de evaluación.
+
+        Args:
+            df: DataFrame con predicciones y datos reales
+
+        Returns:
+            Dict[str, float]: Métricas calculadas
+        """
+        metrics = {}
+        
+        # Verificar que tenemos las columnas necesarias
+        if "prediction" not in df.columns or "future_return" not in df.columns:
+            logger.warning("Faltan columnas necesarias para calcular métricas")
+            return metrics
+        
+        # Métricas para clasificación
+        if "target_direction" in df.columns:
+            # Accuracy
+            metrics["accuracy"] = np.mean(df["prediction"] == df["target_direction"])
+            
+            # Precision, recall para clase positiva (1)
+            true_pos = np.sum((df["prediction"] == 1) & (df["target_direction"] == 1))
+            false_pos = np.sum((df["prediction"] == 1) & (df["target_direction"] == 0))
+            false_neg = np.sum((df["prediction"] == 0) & (df["target_direction"] == 1))
+            
+            if true_pos + false_pos > 0:
+                metrics["precision"] = true_pos / (true_pos + false_pos)
+            else:
+                metrics["precision"] = 0.0
+                
+            if true_pos + false_neg > 0:
+                metrics["recall"] = true_pos / (true_pos + false_neg)
+            else:
+                metrics["recall"] = 0.0
+                
+            # F1 score
+            if metrics["precision"] + metrics["recall"] > 0:
+                metrics["f1"] = 2 * (metrics["precision"] * metrics["recall"]) / (metrics["precision"] + metrics["recall"])
+            else:
+                metrics["f1"] = 0.0
+        
+        # Métricas para regresión
+        metrics["mse"] = np.mean((df["prediction"] - df["future_return"]) ** 2)
+        metrics["rmse"] = np.sqrt(metrics["mse"])
+        metrics["mae"] = np.mean(np.abs(df["prediction"] - df["future_return"]))
+        
+        # Métricas de trading
+        # Simular estrategia simple: comprar cuando prediction=1, vender cuando prediction=0
+        df["position"] = df["prediction"].shift(1).fillna(0)  # Posición basada en predicción anterior
+        df["strategy_return"] = df["position"] * df["future_return"]  # Retorno de la estrategia
+        
+        # Retorno acumulado
+        metrics["cumulative_return"] = np.exp(np.sum(df["strategy_return"])) - 1
+        
+        # Sharpe ratio (anualizado)
+        if df["strategy_return"].std() > 0:
+            annual_factor = 252 if "1D" in self.training_config["timeframe"] else 252 * 24  # Diario o por hora
+            metrics["sharpe_ratio"] = np.sqrt(annual_factor) * df["strategy_return"].mean() / df["strategy_return"].std()
+        else:
+            metrics["sharpe_ratio"] = 0.0
+        
+        # Win rate
+        winning_trades = np.sum(df["strategy_return"] > 0)
+        total_trades = np.sum(df["position"] != 0)
+        if total_trades > 0:
+            metrics["win_rate"] = winning_trades / total_trades
+        else:
+            metrics["win_rate"] = 0.0
+        
+        # Profit factor
+        gross_profit = np.sum(df["strategy_return"][df["strategy_return"] > 0])
+        gross_loss = np.abs(np.sum(df["strategy_return"][df["strategy_return"] < 0]))
+        if gross_loss > 0:
+            metrics["profit_factor"] = gross_profit / gross_loss
+        else:
+            metrics["profit_factor"] = float('inf') if gross_profit > 0 else 0.0
+        
+        # Maximum drawdown
+        cumulative_returns = np.cumprod(1 + df["strategy_return"])
+        peak = np.maximum.accumulate(cumulative_returns)
+        drawdown = (peak - cumulative_returns) / peak
+        metrics["max_drawdown"] = np.max(drawdown)
+        
+        return metrics

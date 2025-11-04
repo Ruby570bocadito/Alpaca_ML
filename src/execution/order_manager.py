@@ -1,0 +1,1015 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Módulo para la gestión de órdenes de trading.
+"""
+
+import logging
+import time
+import uuid
+import random
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Union, Any, Tuple
+from collections import deque
+
+# Importaciones internas
+from .alpaca_client import AlpacaClient
+
+logger = logging.getLogger(__name__)
+
+
+class OrderManager:
+    """Clase para gestionar órdenes de trading."""
+
+    def __init__(self, config: Dict[str, Any], alpaca_client: AlpacaClient):
+        """Inicializa el gestor de órdenes.
+
+        Args:
+            config: Configuración del sistema
+            alpaca_client: Cliente de Alpaca
+        """
+        self.config = config
+        self.alpaca_client = alpaca_client
+        
+        # Configuración de órdenes
+        self.order_config = {
+            # Configuración básica
+            "max_retries": int(config.get("ORDER_MAX_RETRIES", "3")),
+            "retry_delay_seconds": int(config.get("ORDER_RETRY_DELAY_SECONDS", "2")),
+            "order_timeout_seconds": int(config.get("ORDER_TIMEOUT_SECONDS", "60")),
+            "default_order_type": config.get("DEFAULT_ORDER_TYPE", "market"),
+            "default_time_in_force": config.get("DEFAULT_TIME_IN_FORCE", "day"),
+            
+            # Configuración para backoff exponencial
+            "max_backoff_seconds": int(config.get("MAX_BACKOFF_SECONDS", "60")),
+            "jitter_factor": float(config.get("JITTER_FACTOR", "0.1")),
+            
+            # Configuración para idempotencia
+            "client_order_id_prefix": config.get("CLIENT_ORDER_ID_PREFIX", "algo-"),
+            "check_existing_orders": config.get("CHECK_EXISTING_ORDERS", "True").lower() == "true",
+            
+            # Configuración para manejo de errores transitorios
+            "transient_error_keywords": config.get("TRANSIENT_ERROR_KEYWORDS", "rate limit,timeout,connection,network,unavailable").split(","),
+        }
+        
+        # Cola de órdenes pendientes (con metadatos adicionales para reintentos)
+        self.pending_orders = deque()
+        
+        # Historial de órdenes
+        self.order_history = []
+        
+        # Mapeo de órdenes por ID
+        self.orders_by_id = {}
+        
+        # Registro de client_order_ids generados para idempotencia
+        self.generated_client_order_ids = set()
+        
+        logger.info("Gestor de órdenes inicializado")
+        
+    def _is_transient_error(self, error: Exception) -> bool:
+        """Determina si un error es transitorio y se puede reintentar.
+        
+        Args:
+            error: La excepción capturada
+            
+        Returns:
+            bool: True si el error es transitorio, False en caso contrario
+        """
+        error_msg = str(error).lower()
+        
+        # Verificar si el mensaje de error contiene alguna de las palabras clave de errores transitorios
+        for keyword in self.order_config["transient_error_keywords"]:
+            if keyword.strip() in error_msg:
+                return True
+                
+        # También considerar códigos de error HTTP específicos
+        if "429" in error_msg or "503" in error_msg or "504" in error_msg:
+            return True
+            
+        return False
+        
+    def _calculate_backoff_time(self, attempt: int) -> float:
+        """Calcula el tiempo de espera para el backoff exponencial con jitter.
+        
+        Args:
+            attempt: Número de intento actual (comenzando desde 1)
+            
+        Returns:
+            float: Tiempo de espera en segundos
+        """
+        base_delay = self.order_config["retry_delay_seconds"]
+        max_backoff = self.order_config["max_backoff_seconds"]
+        jitter_factor = self.order_config["jitter_factor"]
+        
+        # Calcular backoff exponencial
+        backoff = min(max_backoff, base_delay * (2 ** (attempt - 1)))
+        
+        # Añadir jitter para evitar sincronización de reintentos
+        jitter = random.uniform(0, jitter_factor * backoff)
+        
+        return backoff + jitter
+        
+    def _generate_client_order_id(self, symbol: str, side: str, order_type: str) -> str:
+        """Genera un ID de orden de cliente único y descriptivo.
+        
+        Args:
+            symbol: Símbolo del instrumento
+            side: Lado de la orden (buy/sell)
+            order_type: Tipo de orden (market/limit/etc)
+            
+        Returns:
+            str: ID único para la orden
+        """
+        prefix = self.order_config["client_order_id_prefix"]
+        timestamp = int(time.time())
+        unique_id = str(uuid.uuid4())[:8]  # Usar solo los primeros 8 caracteres del UUID
+        
+        client_order_id = f"{prefix}{symbol}-{side}-{order_type}-{timestamp}-{unique_id}"
+        
+        # Registrar el ID generado para verificación de idempotencia
+        self.generated_client_order_ids.add(client_order_id)
+        
+        return client_order_id
+        
+    def _check_existing_order(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        """Verifica si ya existe una orden con el client_order_id especificado.
+        
+        Args:
+            client_order_id: ID de cliente de la orden a verificar
+            
+        Returns:
+            Optional[Dict[str, Any]]: Información de la orden si existe, None en caso contrario
+        """
+        if not self.order_config["check_existing_orders"]:
+            return None
+            
+        # Verificar si el ID está en nuestro registro local de IDs generados
+        if client_order_id not in self.generated_client_order_ids:
+            return None
+            
+        try:
+            # Buscar órdenes abiertas con este client_order_id
+            max_retries = self.order_config["max_retries"]
+            
+            for attempt in range(1, max_retries + 1):
+                try:
+                    open_orders = self.alpaca_client.get_orders(client_order_id=client_order_id)
+                    
+                    if open_orders and len(open_orders) > 0:
+                        logger.info(f"Orden con client_order_id {client_order_id} ya existe. Evitando duplicado.")
+                        return open_orders[0]
+                        
+                    # También verificar órdenes cerradas recientes
+                    closed_orders = self.alpaca_client.get_orders(status="closed", client_order_id=client_order_id)
+                    
+                    if closed_orders and len(closed_orders) > 0:
+                        logger.info(f"Orden con client_order_id {client_order_id} ya fue ejecutada. Evitando duplicado.")
+                        return closed_orders[0]
+                        
+                    # No se encontró la orden
+                    return None
+                    
+                except Exception as e:
+                    if self._is_transient_error(e) and attempt < max_retries:
+                        wait_time = self._calculate_backoff_time(attempt)
+                        logger.warning(f"Error transitorio al verificar orden existente: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                        time.sleep(wait_time)
+                    else:
+                        # Error permanente o se agotaron los reintentos
+                        logger.error(f"Error al verificar orden existente: {e}", exc_info=True)
+                        return None
+                        
+        except Exception as e:
+            logger.error(f"Error al verificar orden existente: {e}", exc_info=True)
+            
+        return None
+
+    def submit_order(self, order_params: Dict[str, Any]) -> Dict[str, Any]:
+        """Envía una orden a Alpaca con reintentos automáticos e idempotencia.
+
+        Args:
+            order_params: Parámetros de la orden
+
+        Returns:
+            Dict[str, Any]: Información de la orden enviada
+        """
+        # Verificar parámetros mínimos
+        required_params = ["symbol", "qty", "side"]
+        for param in required_params:
+            if param not in order_params:
+                logger.error(f"Falta parámetro requerido: {param}")
+                return {"status": "error", "message": f"Falta parámetro requerido: {param}"}
+        
+        # Completar parámetros con valores por defecto
+        if "type" not in order_params:
+            order_params["type"] = self.order_config["default_order_type"]
+        
+        if "time_in_force" not in order_params:
+            order_params["time_in_force"] = self.order_config["default_time_in_force"]
+        
+        # Generar client_order_id si no existe (idempotencia)
+        if "client_order_id" not in order_params:
+            order_params["client_order_id"] = self._generate_client_order_id(
+                symbol=order_params["symbol"],
+                side=order_params["side"],
+                order_type=order_params["type"]
+            )
+        else:
+            # Registrar el ID proporcionado para verificación de idempotencia
+            self.generated_client_order_ids.add(order_params["client_order_id"])
+        
+        # Verificar si ya existe una orden con este client_order_id (idempotencia)
+        existing_order = self._check_existing_order(order_params["client_order_id"])
+        if existing_order:
+            logger.info(f"Orden con client_order_id {order_params['client_order_id']} ya existe, retornando información existente")
+            return existing_order
+        
+        # Implementar retries con backoff exponencial
+        max_retries = self.order_config["max_retries"]
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Enviar orden
+                result = self.alpaca_client.submit_order(order_params)
+                
+                if result.get("status") == "submitted" or result.get("status") == "accepted" or result.get("status") == "filled":
+                    # Guardar orden en historial
+                    order_info = {
+                        **result,
+                        "submitted_at": datetime.now().isoformat(),
+                        "params": order_params,
+                        "attempts": attempt
+                    }
+                    
+                    self.order_history.append(order_info)
+                    self.orders_by_id[result["order_id"]] = order_info
+                    
+                    logger.info(f"Orden enviada: {order_params['symbol']} {order_params['side']} {order_params['qty']} (intento {attempt})")
+                    return result
+                else:
+                    error_msg = result.get('message', 'Error desconocido')
+                    
+                    # Determinar si el error es transitorio o permanente
+                    if "rate limit" in error_msg.lower() or "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+                        # Error transitorio, reintentar
+                        if attempt < max_retries:
+                            wait_time = self._calculate_backoff_time(attempt)
+                            logger.warning(f"Error transitorio al enviar orden: {error_msg}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                            time.sleep(wait_time)
+                            continue
+                    
+                    # Error permanente o se agotaron los reintentos
+                    logger.error(f"Error al enviar orden después de {attempt} intentos: {error_msg}")
+                    return result
+            
+            except Exception as e:
+                # Determinar si el error es transitorio
+                is_transient = self._is_transient_error(e)
+                
+                if is_transient and attempt < max_retries:
+                    wait_time = self._calculate_backoff_time(attempt)
+                    logger.warning(f"Excepción al enviar orden: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Error al enviar orden después de {max_retries} intentos: {e}", exc_info=True)
+                    return {
+                        "status": "error", 
+                        "message": str(e), 
+                        "params": order_params,
+                        "attempts": attempt,
+                        "client_order_id": order_params["client_order_id"]
+                    }
+        
+        # No debería llegar aquí, pero por si acaso
+        return {
+            "status": "error", 
+            "message": "Máximo número de reintentos alcanzado", 
+            "params": order_params,
+            "attempts": max_retries,
+            "client_order_id": order_params["client_order_id"]
+        }
+
+    def queue_order(self, order_params: Dict[str, Any]) -> Dict[str, Any]:
+        """Encola una orden para envío posterior.
+
+        Args:
+            order_params: Parámetros de la orden
+
+        Returns:
+            Dict[str, Any]: Información de la orden encolada
+        """
+        # Verificar parámetros mínimos
+        required_params = ["symbol", "qty", "side"]
+        for param in required_params:
+            if param not in order_params:
+                logger.error(f"Falta parámetro requerido: {param}")
+                return {"status": "error", "message": f"Falta parámetro requerido: {param}"}
+        
+        # Completar parámetros con valores por defecto
+        if "type" not in order_params:
+            order_params["type"] = self.order_config["default_order_type"]
+        
+        if "time_in_force" not in order_params:
+            order_params["time_in_force"] = self.order_config["default_time_in_force"]
+        
+        # Generar client_order_id si no existe (idempotencia)
+        if "client_order_id" not in order_params:
+            order_params["client_order_id"] = self._generate_client_order_id(
+                symbol=order_params["symbol"],
+                side=order_params["side"],
+                order_type=order_params["type"]
+            )
+        else:
+            # Registrar el ID proporcionado para verificación de idempotencia
+            self.generated_client_order_ids.add(order_params["client_order_id"])
+        
+        # Verificar si ya existe una orden con este client_order_id (idempotencia)
+        existing_order = self._check_existing_order(order_params["client_order_id"])
+        if existing_order:
+            logger.info(f"Orden con client_order_id {order_params['client_order_id']} ya existe, no se encolará nuevamente")
+            return existing_order
+        
+        # Encolar orden
+        queue_entry = {
+            "params": order_params,
+            "queued_at": datetime.now().isoformat(),
+            "attempts": 0,
+            "status": "queued",
+            "next_retry_time": time.time(),  # Disponible para procesamiento inmediato
+            "last_error": None,
+        }
+        
+        self.pending_orders.append(queue_entry)
+        
+        logger.info(f"Orden encolada: {order_params['symbol']} {order_params['side']} {order_params['qty']} (client_order_id: {order_params['client_order_id']})")
+        return {"status": "queued", "queue_entry": queue_entry}
+
+    def process_pending_orders(self) -> Dict[str, Any]:
+        """Procesa órdenes pendientes en la cola con backoff exponencial e idempotencia.
+
+        Returns:
+            Dict[str, Any]: Resultados del procesamiento
+        """
+        if not self.pending_orders:
+            return {"status": "success", "message": "No hay órdenes pendientes", "processed": 0}
+        
+        processed = 0
+        results = []
+        current_time = time.time()
+        
+        # Procesar hasta 10 órdenes por llamada
+        max_to_process = min(10, len(self.pending_orders))
+        
+        for _ in range(max_to_process):
+            if not self.pending_orders:
+                break
+            
+            # Obtener la siguiente orden
+            order_entry = self.pending_orders.popleft()
+            
+            # Verificar si es momento de reintentar esta orden
+            if order_entry.get("next_retry_time", 0) > current_time:
+                # Aún no es tiempo de reintentar, volver a encolar
+                self.pending_orders.append(order_entry)
+                continue
+            
+            # Verificar intentos
+            if order_entry["attempts"] >= self.order_config["max_retries"]:
+                logger.warning(f"Orden descartada después de {order_entry['attempts']} intentos: "
+                             f"{order_entry['params']['symbol']} {order_entry['params']['side']}")
+                
+                order_entry["status"] = "failed"
+                order_entry["message"] = f"Máximo de intentos alcanzado: {self.order_config['max_retries']}"
+                self.order_history.append(order_entry)
+                results.append(order_entry)
+                processed += 1
+                continue
+            
+            # Verificar idempotencia antes de enviar
+            client_order_id = order_entry["params"].get("client_order_id", "")
+            existing_order = self._check_existing_order(client_order_id)
+            if existing_order:
+                logger.info(f"Orden con client_order_id {client_order_id} ya existe, no se procesará nuevamente")
+                results.append(existing_order)
+                processed += 1
+                continue
+            
+            # Incrementar intentos
+            order_entry["attempts"] += 1
+            
+            # Enviar orden
+            result = self.submit_order(order_entry["params"])
+            
+            if result.get("status") == "submitted" or result.get("status") == "accepted" or result.get("status") == "filled":
+                order_entry["status"] = "submitted"
+                order_entry["order_id"] = result.get("order_id")
+                order_entry["submitted_at"] = datetime.now().isoformat()
+                results.append(order_entry)
+                processed += 1
+            else:
+                # Reencolar si falló con backoff exponencial
+                order_entry["last_error"] = result.get("message", "Error desconocido")
+                error_msg = order_entry["last_error"].lower()
+                
+                # Determinar si el error es transitorio usando la función auxiliar
+                is_transient = self._is_transient_error(Exception(error_msg))
+                
+                if is_transient:
+                    # Calcular tiempo de espera con backoff exponencial y jitter
+                    wait_time = self._calculate_backoff_time(order_entry["attempts"])
+                    order_entry["next_retry_time"] = current_time + wait_time
+                    order_entry["last_attempt_time"] = current_time
+                    logger.warning(f"Error transitorio al procesar orden: {error_msg}. Reintentando en {wait_time:.2f}s (intento {order_entry['attempts']}/{self.order_config['max_retries']})")
+                    self.pending_orders.append(order_entry)
+                    results.append({"status": "requeued", "entry": order_entry, "retry_after": wait_time})
+                else:
+                    # Error permanente
+                    logger.error(f"Error permanente al procesar orden: {error_msg}")
+                    order_entry["status"] = "failed"
+                    order_entry["message"] = error_msg
+                    self.order_history.append(order_entry)
+                    results.append(order_entry)
+                    processed += 1
+        
+        return {
+            "status": "success",
+            "message": f"Procesadas {processed} órdenes pendientes",
+            "processed": processed,
+            "results": results,
+            "remaining": len(self.pending_orders),
+        }
+
+    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        """Cancela una orden específica con reintentos automáticos.
+
+        Args:
+            order_id: ID de la orden a cancelar
+
+        Returns:
+            Dict[str, Any]: Resultado de la cancelación
+        """
+        # Implementar retries con backoff exponencial
+        max_retries = self.order_config["max_retries"]
+        retry_delay = self.order_config["retry_delay_seconds"]
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = self.alpaca_client.cancel_order(order_id)
+                
+                if result.get("status") == "cancelled":
+                    # Actualizar estado en historial
+                    if order_id in self.orders_by_id:
+                        self.orders_by_id[order_id]["status"] = "cancelled"
+                        self.orders_by_id[order_id]["cancelled_at"] = datetime.now().isoformat()
+                        self.orders_by_id[order_id]["cancel_attempts"] = attempt
+                    
+                    logger.info(f"Orden cancelada: {order_id} (intento {attempt})")
+                    return result
+                else:
+                    error_msg = result.get('message', 'Error desconocido').lower()
+                    
+                    # Determinar si el error es transitorio usando la función auxiliar
+                    is_transient = self._is_transient_error(Exception(error_msg))
+                    
+                    if is_transient and attempt < max_retries:
+                        # Error transitorio, reintentar con backoff exponencial y jitter
+                        wait_time = self._calculate_backoff_time(attempt)
+                        logger.warning(f"Error transitorio al cancelar orden {order_id}: {error_msg}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                        time.sleep(wait_time)
+                        continue
+                    
+                    # Error permanente o se agotaron los reintentos
+                    logger.error(f"Error al cancelar orden {order_id} después de {attempt} intentos: {error_msg}")
+                    return {"status": "error", "message": error_msg, "order_id": order_id, "attempts": attempt}
+                
+            except Exception as e:
+                # Determinar si el error es transitorio
+                is_transient = self._is_transient_error(e)
+                
+                if is_transient and attempt < max_retries:
+                    wait_time = self._calculate_backoff_time(attempt)
+                    logger.warning(f"Excepción al cancelar orden {order_id}: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Error al cancelar orden {order_id} después de {max_retries} intentos: {e}", exc_info=True)
+                    return {"status": "error", "message": str(e), "order_id": order_id, "attempts": max_retries}
+        
+        # No debería llegar aquí, pero por si acaso
+        return {"status": "error", "message": f"Error desconocido al cancelar orden {order_id}", "attempts": max_retries}
+
+    def cancel_all_orders(self) -> Dict[str, Any]:
+        """Cancela todas las órdenes abiertas con reintentos automáticos.
+
+        Returns:
+            Dict[str, Any]: Resultado de la cancelación
+        """
+        # Implementar retries con backoff exponencial
+        max_retries = self.order_config["max_retries"]
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = self.alpaca_client.cancel_all_orders()
+                
+                # Actualizar estado en historial
+                cancelled_time = datetime.now().isoformat()
+                for order_id, order_info in self.orders_by_id.items():
+                    if order_info.get("status") in ["submitted", "accepted", "new", "partially_filled"]:
+                        order_info["status"] = "cancelled"
+                        order_info["cancelled_at"] = cancelled_time
+                        order_info["cancel_attempts"] = attempt
+                
+                logger.info(f"Todas las órdenes canceladas: {result.get('cancelled_orders_count', 0)} órdenes (intento {attempt})")
+                return result
+                
+            except Exception as e:
+                # Determinar si el error es transitorio usando la función auxiliar
+                is_transient = self._is_transient_error(e)
+                
+                if is_transient and attempt < max_retries:
+                    wait_time = self._calculate_backoff_time(attempt)
+                    logger.warning(f"Error transitorio al cancelar todas las órdenes: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    # Error permanente o se agotaron los reintentos
+                    logger.error(f"Error al cancelar todas las órdenes después de {attempt} intentos: {e}", exc_info=True)
+                    return {"status": "error", "message": str(e), "attempts": attempt}
+        
+        # No debería llegar aquí, pero por si acaso
+        return {"status": "error", "message": "Error desconocido al cancelar todas las órdenes", "attempts": max_retries}
+
+    def get_order_status(self, order_id: str) -> Dict[str, Any]:
+        """Obtiene el estado de una orden con reintentos automáticos.
+
+        Args:
+            order_id: ID de la orden
+
+        Returns:
+            Dict[str, Any]: Estado de la orden
+        """
+        # Implementar retries con backoff exponencial
+        max_retries = self.order_config["max_retries"]
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Intentar obtener de Alpaca
+                order = self.alpaca_client.api.get_order(order_id)
+                
+                # Actualizar en el historial
+                if order_id in self.orders_by_id:
+                    self.orders_by_id[order_id]["status"] = order.status
+                    self.orders_by_id[order_id]["last_updated"] = datetime.now().isoformat()
+                    self.orders_by_id[order_id]["status_check_attempts"] = attempt
+                    
+                    if order.filled_at:
+                        self.orders_by_id[order_id]["filled_at"] = order.filled_at.isoformat()
+                    
+                    if order.filled_qty:
+                        self.orders_by_id[order_id]["filled_qty"] = float(order.filled_qty)
+                    
+                    if order.filled_avg_price:
+                        self.orders_by_id[order_id]["filled_avg_price"] = float(order.filled_avg_price)
+                
+                return {
+                    "order_id": order.id,
+                    "client_order_id": order.client_order_id,
+                    "symbol": order.symbol,
+                    "qty": float(order.qty),
+                    "filled_qty": float(order.filled_qty) if order.filled_qty else 0,
+                    "side": order.side,
+                    "type": order.type,
+                    "status": order.status,
+                    "created_at": order.created_at.isoformat() if order.created_at else None,
+                    "filled_at": order.filled_at.isoformat() if order.filled_at else None,
+                    "filled_avg_price": float(order.filled_avg_price) if order.filled_avg_price else None,
+                    "attempts": attempt
+                }
+                
+            except Exception as e:
+                # Determinar si el error es transitorio usando la función auxiliar
+                is_transient = self._is_transient_error(e)
+                
+                if is_transient and attempt < max_retries:
+                    wait_time = self._calculate_backoff_time(attempt)
+                    logger.warning(f"Error transitorio al obtener estado de orden {order_id}: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    # Error permanente o se agotaron los reintentos
+                    logger.error(f"Error al obtener estado de orden {order_id} después de {attempt} intentos: {e}", exc_info=True)
+                    
+                    # Actualizar historial local si existe
+                    if order_id in self.orders_by_id:
+                        self.orders_by_id[order_id]["status_check_error"] = str(e)
+                        self.orders_by_id[order_id]["status_check_attempts"] = attempt
+                        
+                        return {
+                            "status": "unknown",
+                            "message": f"Error al obtener estado: {str(e)}",
+                            "last_known_status": self.orders_by_id[order_id].get("status"),
+                            "order_id": order_id,
+                            "attempts": attempt
+                        }
+                    
+                    return {"status": "error", "message": str(e), "order_id": order_id, "attempts": attempt}
+        
+        # No debería llegar aquí, pero por si acaso
+        return {"status": "error", "message": f"Error desconocido al obtener estado de orden {order_id}", "attempts": max_retries}
+
+    def get_open_orders(self) -> List[Dict[str, Any]]:
+        """Obtiene todas las órdenes abiertas con reintentos automáticos para errores transitorios.
+
+        Returns:
+            List[Dict[str, Any]]: Lista de órdenes abiertas
+        """
+        # Implementar retries con backoff exponencial
+        max_retries = self.order_config["max_retries"]
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = self.alpaca_client.get_orders()
+                
+                # Actualizar historial local
+                current_time = datetime.now().isoformat()
+                for order in result:
+                    order_id = order["id"]
+                    if order_id in self.orders_by_id:
+                        self.orders_by_id[order_id].update(order)
+                        self.orders_by_id[order_id]["last_updated"] = current_time
+                    else:
+                        order["last_updated"] = current_time
+                        self.orders_by_id[order_id] = order
+                        self.order_history.append(order)
+                
+                logger.debug(f"Órdenes abiertas obtenidas: {len(result)} (intento {attempt})")
+                return result
+                
+            except Exception as e:
+                # Determinar si el error es transitorio
+                is_transient = self._is_transient_error(e)
+                
+                if is_transient and attempt < max_retries:
+                    wait_time = self._calculate_backoff_time(attempt)
+                    logger.warning(f"Error transitorio al obtener órdenes abiertas: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    # Error permanente o se agotaron los reintentos
+                    logger.error(f"Error al obtener órdenes abiertas después de {attempt} intentos: {e}", exc_info=True)
+                    return []
+        
+        # No debería llegar aquí, pero por si acaso
+        return []
+
+    def get_order_history(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Obtiene el historial de órdenes con reintentos automáticos para errores transitorios.
+
+        Args:
+            limit: Número máximo de órdenes a devolver
+
+        Returns:
+            List[Dict[str, Any]]: Lista de órdenes históricas
+        """
+        # Primero devolver nuestro historial local si es suficiente
+        if len(self.order_history) >= limit:
+            return self.order_history[-limit:]
+        
+        # Implementar retries con backoff exponencial
+        max_retries = self.order_config["max_retries"]
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Consultar a Alpaca
+                result = self.alpaca_client.get_orders(status="all", limit=limit)
+                
+                # Actualizar historial local
+                current_time = datetime.now().isoformat()
+                for order in result:
+                    order_id = order["id"]
+                    if order_id in self.orders_by_id:
+                        self.orders_by_id[order_id].update(order)
+                        self.orders_by_id[order_id]["last_updated"] = current_time
+                    else:
+                        order["last_updated"] = current_time
+                        self.orders_by_id[order_id] = order
+                        self.order_history.append(order)
+                
+                logger.debug(f"Historial de órdenes obtenido: {len(result)} (intento {attempt})")
+                return result
+                
+            except Exception as e:
+                # Determinar si el error es transitorio
+                is_transient = self._is_transient_error(e)
+                
+                if is_transient and attempt < max_retries:
+                    wait_time = self._calculate_backoff_time(attempt)
+                    logger.warning(f"Error transitorio al obtener historial de órdenes: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    # Error permanente o se agotaron los reintentos
+                    logger.error(f"Error al obtener historial de órdenes después de {attempt} intentos: {e}", exc_info=True)
+                    # Devolver lo que tengamos en historial local
+                    return self.order_history[-limit:] if limit > 0 else self.order_history
+        
+        # No debería llegar aquí, pero por si acaso
+        return self.order_history[-limit:] if limit > 0 else self.order_history
+
+    def replace_order(self, order_id: str, qty: float = None, limit_price: float = None, 
+                      stop_price: float = None, client_order_id: str = None) -> Dict[str, Any]:
+        """Reemplaza una orden existente con nuevos parámetros, utilizando reintentos con backoff exponencial.
+
+        Args:
+            order_id: ID de la orden a reemplazar
+            qty: Nueva cantidad (opcional)
+            limit_price: Nuevo precio límite (opcional)
+            stop_price: Nuevo precio stop (opcional)
+            client_order_id: Nuevo ID de cliente (opcional)
+
+        Returns:
+            Dict[str, Any]: Información de la orden reemplazada
+        """
+        if not order_id:
+            logger.error("Se requiere order_id para reemplazar una orden")
+            return {"status": "error", "message": "Se requiere order_id"}
+        
+        # Generar nuevo client_order_id si no se proporciona (idempotencia)
+        if client_order_id is None:
+            # Obtener información básica de la orden para generar un ID descriptivo
+            try:
+                current_order = self.alpaca_client.get_order(order_id)
+                symbol = current_order.get("symbol", "unknown")
+                client_order_id = self._generate_client_order_id(
+                    symbol=symbol,
+                    side=current_order.get("side", "unknown"),
+                    order_type="replace"
+                )
+            except Exception as e:
+                logger.error(f"Error al obtener información de la orden para generar client_order_id: {e}")
+                # Generar un ID genérico si no podemos obtener la información de la orden
+                client_order_id = self._generate_client_order_id(
+                    symbol="unknown",
+                    side="unknown",
+                    order_type="replace"
+                )
+        else:
+            # Registrar el ID proporcionado para verificación de idempotencia
+            self.generated_client_order_ids.add(client_order_id)
+        
+        # Verificar si ya existe una orden con este client_order_id (idempotencia)
+        existing_order = self._check_existing_order(client_order_id)
+        if existing_order:
+            logger.info(f"Orden con client_order_id {client_order_id} ya existe, retornando información existente")
+            return existing_order
+        
+        # Implementar retries con backoff exponencial
+        max_retries = self.order_config["max_retries"]
+        current_order = None
+        
+        # Paso 1: Obtener la orden actual con reintentos
+        for attempt in range(1, max_retries + 1):
+            try:
+                current_order = self.alpaca_client.get_order(order_id)
+                break
+            except Exception as e:
+                is_transient = self._is_transient_error(e)
+                
+                if is_transient and attempt < max_retries:
+                    wait_time = self._calculate_backoff_time(attempt)
+                    logger.warning(f"Error transitorio al obtener orden {order_id}: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Error al obtener orden {order_id} después de {attempt} intentos: {e}", exc_info=True)
+                    return {"status": "error", "message": f"Error al obtener orden: {str(e)}", "attempts": attempt}
+        
+        if not current_order:
+            return {"status": "error", "message": "No se pudo obtener la orden actual"}
+        
+        # Paso 2: Cancelar la orden existente con reintentos
+        for attempt in range(1, max_retries + 1):
+            try:
+                cancel_result = self.alpaca_client.cancel_order(order_id)
+                logger.info(f"Orden {order_id} cancelada para reemplazo (intento {attempt})")
+                break
+            except Exception as e:
+                is_transient = self._is_transient_error(e)
+                
+                if is_transient and attempt < max_retries:
+                    wait_time = self._calculate_backoff_time(attempt)
+                    logger.warning(f"Error transitorio al cancelar orden {order_id}: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Error al cancelar orden {order_id} después de {attempt} intentos: {e}", exc_info=True)
+                    return {"status": "error", "message": f"Error al cancelar orden: {str(e)}", "attempts": attempt}
+        
+        # Preparar parámetros para la nueva orden
+        new_order_params = {
+            "symbol": current_order["symbol"],
+            "qty": qty if qty is not None else current_order["qty"],
+            "side": current_order["side"],
+            "type": current_order["type"],
+            "time_in_force": current_order["time_in_force"],
+        }
+        
+        # Añadir parámetros opcionales si se proporcionan
+        if limit_price is not None:
+            new_order_params["limit_price"] = limit_price
+        elif "limit_price" in current_order:
+            new_order_params["limit_price"] = current_order["limit_price"]
+            
+        if stop_price is not None:
+            new_order_params["stop_price"] = stop_price
+        elif "stop_price" in current_order:
+            new_order_params["stop_price"] = current_order["stop_price"]
+        
+        new_order_params["client_order_id"] = client_order_id
+        
+        # Paso 3: Enviar la nueva orden con reintentos
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = self.alpaca_client.submit_order(new_order_params)
+                
+                if result.get("status") == "accepted" or result.get("status") == "submitted" or result.get("status") == "filled":
+                    logger.info(f"Orden reemplazada: {order_id} -> {result.get('id')} (intento {attempt})")
+                    
+                    # Guardar en historial
+                    order_info = {
+                        **result,
+                        "submitted_at": datetime.now().isoformat(),
+                        "params": new_order_params,
+                        "replaced_order_id": order_id,
+                        "attempts": attempt
+                    }
+                    self.order_history.append(order_info)
+                    self.orders_by_id[result["id"]] = order_info
+                    
+                    return result
+                else:
+                    logger.warning(f"Estado inesperado al reemplazar orden: {result.get('status')}")
+                    return result
+            except Exception as e:
+                is_transient = self._is_transient_error(e)
+                
+                if is_transient and attempt < max_retries:
+                    wait_time = self._calculate_backoff_time(attempt)
+                    logger.warning(f"Error transitorio al enviar nueva orden: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Error al enviar nueva orden después de {attempt} intentos: {e}", exc_info=True)
+                    return {
+                        "status": "error", 
+                        "message": str(e), 
+                        "replaced_order_id": order_id,
+                        "attempts": attempt,
+                        "client_order_id": client_order_id
+                    }
+        
+        # No debería llegar aquí, pero por si acaso
+        return {
+            "status": "error", 
+            "message": "Máximo número de reintentos alcanzado", 
+            "replaced_order_id": order_id,
+            "attempts": max_retries,
+            "client_order_id": client_order_id
+        }
+
+    def create_bracket_order(self, entry_params: Dict[str, Any], 
+                           take_profit_pct: float, 
+                           stop_loss_pct: float) -> Dict[str, Any]:
+        """Crea una orden bracket (entrada, take profit, stop loss) con manejo robusto de errores.
+
+        Args:
+            entry_params: Parámetros de la orden de entrada
+            take_profit_pct: Porcentaje de take profit
+            stop_loss_pct: Porcentaje de stop loss
+
+        Returns:
+            Dict[str, Any]: Resultado de la creación
+        """
+        # Verificar parámetros mínimos
+        required_params = ["symbol", "qty", "side"]
+        for param in required_params:
+            if param not in entry_params:
+                logger.error(f"Falta parámetro requerido: {param}")
+                return {"status": "error", "message": f"Falta parámetro requerido: {param}"}
+        
+        # Extraer parámetros principales
+        symbol = entry_params["symbol"]
+        side = entry_params["side"]
+        qty = abs(float(entry_params["qty"]))  # Asegurar que es positivo
+        
+        # Generar client_order_id si no existe (idempotencia)
+        if "client_order_id" not in entry_params:
+            entry_params["client_order_id"] = self._generate_client_order_id(
+                symbol=symbol,
+                side=side,
+                order_type="bracket"
+            )
+        else:
+            # Registrar el ID proporcionado para verificación de idempotencia
+            self.generated_client_order_ids.add(entry_params["client_order_id"])
+        
+        # Verificar si ya existe una orden con este client_order_id (idempotencia)
+        existing_order = self._check_existing_order(entry_params["client_order_id"])
+        if existing_order:
+            logger.info(f"Orden con client_order_id {entry_params['client_order_id']} ya existe, retornando información existente")
+            return existing_order
+        
+        # Implementar retries con backoff exponencial
+        max_retries = self.order_config["max_retries"]
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Obtener precio actual
+                latest_trade = self.alpaca_client.get_latest_trade(symbol)
+                if not latest_trade or "price" not in latest_trade:
+                    if attempt < max_retries:
+                        wait_time = self._calculate_backoff_time(attempt)
+                        logger.warning(f"No se pudo obtener precio actual para {symbol}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        logger.error(f"No se pudo obtener precio actual para {symbol} después de {max_retries} intentos")
+                        return {"status": "error", "message": f"No se pudo obtener precio actual para {symbol}", "attempts": max_retries}
+                
+                current_price = latest_trade["price"]
+                
+                # Calcular precios de take profit y stop loss
+                if side == "buy":
+                    take_profit_price = round(current_price * (1 + take_profit_pct / 100), 2)
+                    stop_loss_price = round(current_price * (1 - stop_loss_pct / 100), 2)
+                else:  # sell
+                    take_profit_price = round(current_price * (1 - take_profit_pct / 100), 2)
+                    stop_loss_price = round(current_price * (1 + stop_loss_pct / 100), 2)
+                
+                # Crear orden bracket usando la API de Alpaca
+                try:
+                    order = self.alpaca_client.api.submit_order(
+                        symbol=symbol,
+                        qty=qty,
+                        side=side,
+                        type="market",
+                        time_in_force="day",
+                        order_class="bracket",
+                        take_profit={"limit_price": str(take_profit_price)},
+                        stop_loss={"stop_price": str(stop_loss_price), "limit_price": str(stop_loss_price * 0.99 if side == "buy" else stop_loss_price * 1.01)},
+                        client_order_id=entry_params["client_order_id"]
+                    )
+                    
+                    # Guardar en historial
+                    order_info = {
+                        "order_id": order.id,
+                        "client_order_id": order.client_order_id,
+                        "symbol": order.symbol,
+                        "qty": float(order.qty),
+                        "side": order.side,
+                        "type": order.type,
+                        "status": order.status,
+                        "submitted_at": datetime.now().isoformat(),
+                        "order_class": "bracket",
+                        "take_profit_price": take_profit_price,
+                        "stop_loss_price": stop_loss_price,
+                        "attempts": attempt,
+                        "params": entry_params
+                    }
+                    
+                    self.order_history.append(order_info)
+                    self.orders_by_id[order.id] = order_info
+                    
+                    logger.info(f"Orden bracket creada: {symbol} {side} {qty} (TP: {take_profit_price}, SL: {stop_loss_price}) (intento {attempt})")
+                    
+                    return {
+                        "status": "submitted",
+                        "order_id": order.id,
+                        "symbol": symbol,
+                        "side": side,
+                        "qty": float(order.qty),
+                        "take_profit_price": take_profit_price,
+                        "stop_loss_price": stop_loss_price,
+                    }
+                    
+                except Exception as e:
+                    # Determinar si el error es transitorio usando la función auxiliar
+                    is_transient = self._is_transient_error(e)
+                    
+                    if is_transient and attempt < max_retries:
+                        wait_time = self._calculate_backoff_time(attempt)
+                        logger.warning(f"Error transitorio al crear orden bracket: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                        time.sleep(wait_time)
+                        continue
+                    
+                    # Error permanente o se agotaron los reintentos
+                    logger.error(f"Error al crear orden bracket después de {attempt} intentos: {e}", exc_info=True)
+                    return {"status": "error", "message": str(e), "attempts": attempt}
+            
+            except Exception as e:
+                # Determinar si el error es transitorio
+                is_transient = self._is_transient_error(e)
+                
+                if is_transient and attempt < max_retries:
+                    wait_time = self._calculate_backoff_time(attempt)
+                    logger.warning(f"Excepción al crear orden bracket: {e}. Reintentando en {wait_time:.2f}s (intento {attempt}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Error al crear orden bracket después de {max_retries} intentos: {e}", exc_info=True)
+                    return {"status": "error", "message": str(e), "attempts": max_retries}
+        
+        # No debería llegar aquí, pero por si acaso
+        return {"status": "error", "message": "Error desconocido al crear orden bracket", "attempts": max_retries}
