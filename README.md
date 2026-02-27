@@ -686,19 +686,3 @@ python src/api/run_api_server.py
 ```bash
 python examples/trading_example.py
 ```
-
-## Roadmap de Mejoras
-
-Este es el plan de mejoras propuesto por áreas clave. Cada punto incluye el beneficio y una línea base de implementación para integrarlo al sistema actual.
-
-### Arquitectura y Robustez
-- Gestión de errores y resiliencia: Decorador global de reintentos con backoff exponencial para Alpaca y Redis usando `tenacity` o wrapper propio. Implementación prevista: `src/utils/retry.py` y aplicación en `alpaca_client.py`, `mcp_server.py`, `queue_manager.py`.
-- Persistencia de colas: Almacenar estado de jobs, órdenes y señales en una DB ligera (`SQLite` o `PostgreSQL`). Implementación prevista: `src/data/store.py` (tablas `jobs`, `orders`, `signals`) y hooks en `QueueManager` y `TradeManager`.
-- Logs estructurados: Emisión de logs JSON con `structlog` incluyendo metadatos (symbol, estrategia, resultado, latencia). Implementación prevista: `src/utils/logging.py` y uso consistente en módulos críticos.
-- Supervisión: Microservicio o tarea cron que revise colas, órdenes y alertas cada X minutos y notifique bloqueos. Implementación prevista: `src/monitoring/supervisor.py` con integración a Telegram/Discord.
-
-### Machine Learning y Estrategia
-- Data pipeline: Módulo `data_collector.py` que guarda candles y features en DB (SQLite/Mongo). Implementación prevista: `src/data/collector.py` con ingesta programada y cache.
-- Feature engineering dinámico: Integración de librerías `ta` y/o `vectorbt` para features técnicos (RSI, MACD, VWAP, ATR). Implementación prevista: ampliar `src/features/engineering.py`.
-- Autoentrenamiento: Job recurrente (cada 24h) en `TRAINING_QUEUE` que reentrena y versiona modelos automáticamente. Implementación prevista: orquestación desde `src/models/auto_trainer.py` y `src/queue/queue_manager.py`.
-- Validación continua: Pipeline de paper validation (entrena → evalúa → decide desplegar). Implementación prevista: `src/models/validation.py` y registro de métricas/artefactos en `store.py`.
